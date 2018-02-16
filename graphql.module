@@ -6,6 +6,16 @@
  */
 
 use Drupal\Core\Url;
+use Drupal\graphql\Utility\StringHelper;
+
+define('GRAPHQL_SCALAR_PLUGIN', 'scalar');
+define('GRAPHQL_FIELD_PLUGIN', 'field');
+define('GRAPHQL_MUTATION_PLUGIN', 'mutation');
+define('GRAPHQL_INTERFACE_PLUGIN', 'interface');
+define('GRAPHQL_UNION_TYPE_PLUGIN', 'union');
+define('GRAPHQL_INPUT_TYPE_PLUGIN', 'input');
+define('GRAPHQL_TYPE_PLUGIN', 'type');
+define('GRAPHQL_ENUM_PLUGIN', 'enum');
 
 /**
  * Implements hook_help().
@@ -21,48 +31,11 @@ function graphql_help($routeName) {
   <a href="http://graphql.org/" target="_blank">GraphQL</a> schema for
   <a href="https://www.drupal.org/8" target="_blank">Drupal 8</a> entities,
   and allows you to expose your own custom schema in a consistent way and with
-  minimal effort.</p>
-
-<p>It is probably the easiest way to build headless Drupal sites using the popular
-  <a href="https://facebook.github.io/react/" target="_blank">React</a> /
-  <a href="https://facebook.github.io/relay/" target="_blank">Relay</a> couple
-  for the front-end, on top of the traditional fast Drupal site building for 
-  content modeling and management.</p>
-
-<p>Its complete redacted documentation (not a generated API) is available on 
-  <a href="https://fgm.gitbooks.io/graphql-for-drupal/content">Github</a>, 
-  including an introduction, a "Getting started" section, documentation about 
-  the concepts, various ways to build a front-end using the module, how to
-  extend the module schema to support custom data, how to debug, and how to
-  contribute to the module.</p>
-');
-
-  $endpointRoute = 'graphql.request';
-  $endpointPath = \Drupal::urlGenerator()->generateFromRoute($endpointRoute, [], ['absolute' => TRUE]);
-  $endpointUrl = Url::fromRoute($endpointRoute)->toString();
-
-  $explorerRoute = 'graphql.explorer';
-  $explorerPath = \Drupal::urlGenerator()->getPathFromRoute($explorerRoute);
-  $explorerUrl = Url::fromRoute($explorerRoute)->toString();
-
-  $exploring = t('Exploring / consuming the API');
-  $graphiql = t('
-<p>The module comes with a bundled version of the standard GraphQL explorer
-  graphiql, available at <a href=":explorerUrl">:explorerPath</a></p>
-   
-<p>The GraphQL endpoint for clients is exposed at <a href=":endpointUrl">:endpointPath</a></p>', [
-  ':explorerPath' => $explorerPath,
-  ':explorerUrl' => $explorerUrl,
-  ':endpointPath' => $endpointPath,
-  ':endpointUrl' => $endpointUrl,
-]);
+  minimal effort.</p>');
 
   $help = <<<EOT
 <h3>$title</h3>
 $description
-
-<h3>$exploring</h3>
-$graphiql
 EOT;
 
   return $help;
@@ -77,5 +50,138 @@ function graphql_theme() {
       'render element' => 'elements',
       'base hook' => 'block',
     ],
+    'page__graphql_voyager' => [
+      'render element' => 'elements',
+      'base hook' => 'block',
+    ],
   ];
+}
+
+/**
+ * Implements hook_graphql_interfaces_alter().
+ *
+ * Flatten the interface inheritance tree.
+ */
+function graphql_graphql_interfaces_alter(&$definitions) {
+  $interfaces = array_map(function($definition) use ($definitions) {
+    return graphql_list_interfaces($definitions, $definition);
+  }, $definitions);
+
+  foreach ($interfaces as $index => $list) {
+    $definition['interfaces'] = $list;
+  }
+}
+
+/**
+ * Implements hook_graphql_types_alter().
+ *
+ * Flatten the interface inheritance tree.
+ */
+function graphql_graphql_types_alter(&$definitions) {
+  $interfaceDefinitions = \Drupal::service('plugin.manager.graphql.interface')->getDefinitions();
+
+  $interfaces = array_map(function($definition) use ($interfaceDefinitions) {
+    return graphql_list_interfaces($interfaceDefinitions, $definition);
+  }, $definitions);
+
+  foreach ($interfaces as $index => $list) {
+    $definitions[$index]['interfaces'] = $list;
+  }
+}
+
+/**
+ * Helper function to decorate legacy definitions.
+ *
+ * @param array $definitions
+ *   A plugin definitions array.
+ */
+function _graphql_decorate_deprecated_type(array &$definitions) {
+  foreach ($definitions as &$definition) {
+    if (!empty($definition['type'])) {
+      if (!empty($definition['multi'])) {
+        $definition['type'] = StringHelper::listType($definition['type']);
+      }
+
+      if (isset($definition['nullable']) && empty($definition['nullable'])) {
+        $definition['type'] = StringHelper::nonNullType($definition['type']);
+      }
+    }
+
+    if (!empty($definition['fields'])) {
+      _graphql_decorate_deprecated_type($definition['fields']);
+    }
+
+    if (!empty($definition['arguments'])) {
+      _graphql_decorate_deprecated_type($definition['arguments']);
+    }
+  }
+}
+
+/**
+ * Implements hook_graphql_fields_alter().
+ */
+function graphql_graphql_fields_alter(&$definitions) {
+  _graphql_decorate_deprecated_type($definitions);
+}
+
+/**
+ * Implements hook_graphql_mutations_alter().
+ */
+function graphql_graphql_mutations_alter(&$definitions) {
+  _graphql_decorate_deprecated_type($definitions);
+}
+
+/**
+ * Implements hook_graphql_input_types_alter().
+ */
+function graphql_graphql_input_types_alter(&$definitions) {
+  _graphql_decorate_deprecated_type($definitions);
+}
+
+/**
+ * Get a flattened list of a plugins interface inheritance tree.
+ *
+ * @param array $definitions
+ *   The list of interface definitions.
+ * @param mixed $definition
+ *   A plugin definition.
+ *
+ * @return string[]
+ *   A list of interface names.
+ */
+function graphql_list_interfaces(array &$definitions, $definition) {
+  $parents = array_filter($definitions, function($parent) use ($definition) {
+    return in_array($parent['name'], $definition['interfaces']);
+  });
+
+  $interfaces = array_reduce(array_map(function($parent) use ($definitions) {
+    return graphql_list_interfaces($definitions, $parent);
+  }, $parents), 'array_merge', $definition['interfaces']);
+
+  return $interfaces;
+}
+
+/**
+ * Implements hook_graphql_schema_operations().
+ */
+function graphql_graphql_schema_operations($pluginId, array $pluginDefinition) {
+  $operations = [];
+
+  if (\Drupal::currentUser()->hasPermission('use graphql explorer')) {
+    $operations['explorer'] = [
+      'title' => 'Explorer',
+      'weight' => 10,
+      'url' => Url::fromRoute("graphql.explorer.$pluginId"),
+    ];
+  }
+
+  if (\Drupal::currentUser()->hasPermission('use graphql voyager')) {
+    $operations['voyager'] = [
+      'title' => 'Voyager',
+      'weight' => 10,
+      'url' => Url::fromRoute("graphql.voyager.$pluginId"),
+    ];
+  }
+
+  return $operations;
 }

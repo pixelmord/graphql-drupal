@@ -5,7 +5,10 @@ namespace Drupal\graphql\Controller;
 use Drupal\Core\DependencyInjection\ContainerInjectionInterface;
 use Drupal\Core\Routing\UrlGeneratorInterface;
 use Drupal\Core\StringTranslation\StringTranslationTrait;
+use Drupal\graphql\GraphQL\Schema\SchemaLoader;
+use Drupal\graphql\GraphQL\Utility\Introspection;
 use Symfony\Component\DependencyInjection\ContainerInterface;
+use Symfony\Component\HttpFoundation\Request;
 
 /**
  * Controller for the GraphiQL query builder IDE.
@@ -21,40 +24,71 @@ class ExplorerController implements ContainerInjectionInterface {
   protected $urlGenerator;
 
   /**
-   * Constructs a ExplorerController object.
+   * The introspection service.
    *
-   * @param \Drupal\Core\Routing\UrlGeneratorInterface $urlGenerator
-   *   The url generator service.
+   * @var \Drupal\graphql\GraphQL\Utility\Introspection
    */
-  public function __construct(UrlGeneratorInterface $urlGenerator) {
-    $this->urlGenerator = $urlGenerator;
-  }
+  protected $introspection;
+
+  /**
+   * The schema loader service.
+   *
+   * @var \Drupal\graphql\GraphQL\Schema\SchemaLoader
+   */
+  protected $schemaLoader;
 
   /**
    * {@inheritdoc}
    */
   public static function create(ContainerInterface $container) {
     return new static(
-      $container->get('url_generator')
+      $container->get('url_generator'),
+      $container->get('graphql.introspection'),
+      $container->get('graphql.schema_loader')
     );
+  }
+
+  /**
+   * ExplorerController constructor.
+   *
+   * @param \Drupal\Core\Routing\UrlGeneratorInterface $urlGenerator
+   *   The url generator service.
+   * @param \Drupal\graphql\GraphQL\Utility\Introspection $introspection
+   *   The introspection service.
+   * @param \Drupal\graphql\GraphQL\Schema\SchemaLoader $schemaLoader
+   *   The schema loader service.
+   */
+  public function __construct(UrlGeneratorInterface $urlGenerator, Introspection $introspection, SchemaLoader $schemaLoader) {
+    $this->urlGenerator = $urlGenerator;
+    $this->introspection = $introspection;
+    $this->schemaLoader = $schemaLoader;
   }
 
   /**
    * Controller for the GraphiQL query builder IDE.
    *
-   * @return array
+   * @param string $schema
+   *   The name of the schema.
+   * @param \Symfony\Component\HttpFoundation\Request $request
+   *   The request.
+   *
+   * @return array The render array.
    *   The render array.
    */
-  public function viewExplorer() {
-    $url = $this->urlGenerator->generate('graphql.request');
+  public function viewExplorer($schema, Request $request) {
+    $url = $this->urlGenerator->generate("graphql.query.$schema");
+    $introspectionData = $this->introspection->introspect($schema);
 
     return [
       '#type' => 'page',
       '#theme' => 'page__graphql_explorer',
       '#attached' => [
-       'library' => ['graphql/explorer'],
+        'library' => ['graphql/explorer'],
         'drupalSettings' => [
-          'graphQLRequestUrl' => $url
+          'graphqlRequestUrl' => $url,
+          'graphqlIntrospectionData' => $introspectionData,
+          'graphqlQuery' => $request->get('query'),
+          'graphqlVariables' => $request->get('variables'),
         ],
       ],
     ];

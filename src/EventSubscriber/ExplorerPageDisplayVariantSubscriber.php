@@ -10,6 +10,7 @@ use Symfony\Component\EventDispatcher\EventSubscriberInterface;
  * Disables any display variant on the explorer page.
  */
 class ExplorerPageDisplayVariantSubscriber implements EventSubscriberInterface {
+
   /**
    * Disables any display variant on the explorer page.
    *
@@ -17,7 +18,7 @@ class ExplorerPageDisplayVariantSubscriber implements EventSubscriberInterface {
    *   The event to process.
    */
   public function onSelectPageDisplayVariant(PageDisplayVariantSelectionEvent $event) {
-    if ($event->getRouteMatch()->getRouteName() === 'graphql.explorer') {
+    if (strpos($event->getRouteMatch()->getRouteName(), 'graphql.explorer.') === 0) {
       $event->setPluginId(NULL)->stopPropagation();
     }
   }
@@ -26,7 +27,10 @@ class ExplorerPageDisplayVariantSubscriber implements EventSubscriberInterface {
    * {@inheritdoc}
    */
   public static function getSubscribedEvents() {
-    $events[RenderEvents::SELECT_PAGE_DISPLAY_VARIANT][] = ['onSelectPageDisplayVariant'];
+    $events = [
+      RenderEvents::SELECT_PAGE_DISPLAY_VARIANT => [['onSelectPageDisplayVariant']],
+    ];
+
     return $events;
   }
 }

@@ -1,0 +1,37 @@
+query ($nid: String!) {
+  node:nodeQuery(filter: {
+    conditions: [{
+      field: "nid"
+      value: [$nid]
+    }]
+  }) {
+    entities {
+      entityId
+      entityUuid
+      entityLabel
+      entityType
+      entityBundle
+      entityLanguage {
+        id
+        name
+        direction
+        weight
+      }
+      entityUrl {
+        path
+      }
+      entityOwner {
+        entityLabel
+      }
+      entityTranslation(language: fr) {
+        entityLabel
+      }
+      entityPublished
+      entityCreated
+      entityChanged
+      viewAccess:entityAccess(operation: "view")
+      updateAccess:entityAccess(operation: "update")
+      deleteAccess:entityAccess(operation: "delete")
+    }
+  }
+}

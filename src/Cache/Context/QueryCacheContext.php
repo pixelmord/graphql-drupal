@@ -28,6 +28,13 @@ class QueryCacheContext implements CacheContextInterface {
   protected $contextCache;
 
   /**
+   * {@inheritdoc}
+   */
+  public static function getLabel() {
+    return t('Query');
+  }
+
+  /**
    * Constructs a new QueryCacheContext class.
    *
    * @param \Symfony\Component\HttpFoundation\RequestStack $requestStack
@@ -36,13 +43,6 @@ class QueryCacheContext implements CacheContextInterface {
   public function __construct(RequestStack $requestStack) {
     $this->requestStack = $requestStack;
     $this->contextCache = new \SplObjectStorage();
-  }
-
-  /**
-   * {@inheritdoc}
-   */
-  public static function getLabel() {
-    return t('Query');
   }
 
   /**
@@ -57,15 +57,18 @@ class QueryCacheContext implements CacheContextInterface {
     $hash = '';
     if ($request->attributes->has('query')) {
       $hash = $this->contextCache[$request] = $this->getHash(
+        $request->attributes->get('schema') ?: '',
         $request->attributes->get('query') ?: '',
         $request->attributes->get('variables') ?: []
       );
     }
     else if ($request->attributes->has('queries')) {
       $queries = $request->attributes->get('queries');
+      $schema = $request->attributes->get('schema') ?: '';
 
-      $hash = hash('sha256', json_encode(array_map(function ($item) {
+      return hash('sha256', json_encode(array_map(function($item) use ($schema) {
         return $this->getHash(
+          $schema,
           !empty($item['query']) ? $item['query'] : '',
           !empty($item['variables']) ? $item['variables'] : []
         );
@@ -81,6 +84,8 @@ class QueryCacheContext implements CacheContextInterface {
    * Sorts the variables by their key and eliminates whitespace from the query
    * to enable better reuse of the cache entries.
    *
+   * @param string $schema
+   *   The schema id.
    * @param string $query
    *   The graphql query string.
    * @param array $variables
@@ -89,11 +94,12 @@ class QueryCacheContext implements CacheContextInterface {
    * @return string
    *   The hashed string containing.
    */
-  protected function getHash($query = '', array $variables = []) {
+  protected function getHash($schema = '', $query = '', array $variables = []) {
     $query = preg_replace('/\s{2,}/', ' ', $query);
     ksort($variables);
 
     return hash('sha256', json_encode([
+      'schema' => $schema,
       'query' => $query,
       'variables' => $variables,
     ]));

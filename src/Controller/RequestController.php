@@ -11,14 +11,14 @@ use Drupal\Core\Config\Config;
 use Drupal\Core\DependencyInjection\ContainerInjectionInterface;
 use Drupal\Core\Render\RenderContext;
 use Drupal\Core\Render\RendererInterface;
-use Drupal\graphql\GraphQL\Execution\Processor;
-use Drupal\graphql\Reducers\ReducerManager;
+use Drupal\Core\Url;
+use Drupal\graphql\Cache\CacheableQueryResponse;
+use Drupal\graphql\GraphQL\Execution\QueryProcessor;
 use Symfony\Component\DependencyInjection\ContainerInterface;
 use Symfony\Component\HttpFoundation\Request;
 use Symfony\Component\HttpFoundation\RequestStack;
 use Symfony\Component\HttpFoundation\Response;
 use Symfony\Component\HttpKernel\HttpKernelInterface;
-use Youshido\GraphQL\Schema\AbstractSchema;
 
 /**
  * Handles GraphQL requests.
@@ -31,20 +31,6 @@ class RequestController implements ContainerInjectionInterface {
    * @var \Drupal\Core\Config\Config
    */
   protected $config;
-
-  /**
-   * The dependency injection container.
-   *
-   * @var \Symfony\Component\DependencyInjection\ContainerInterface
-   */
-  protected $container;
-
-  /**
-   * The graphql schema.
-   *
-   * @var \Youshido\GraphQL\Schema\AbstractSchema
-   */
-  protected $schema;
 
   /**
    * The http kernel.
@@ -61,13 +47,6 @@ class RequestController implements ContainerInjectionInterface {
   protected $renderer;
 
   /**
-   * The reducer manager service.
-   *
-   * @var \Drupal\graphql\Reducers\ReducerManager
-   */
-  protected $reducerManager;
-
-  /**
    * The request stack service.
    *
    * @var \Symfony\Component\HttpFoundation\RequestStack
@@ -75,14 +54,35 @@ class RequestController implements ContainerInjectionInterface {
   protected $requestStack;
 
   /**
-   * Constructs a RequestController object.
+   * The query processor.
    *
-   * @param \Symfony\Component\DependencyInjection\ContainerInterface $container
-   *   The dependency injection container.
-   * @param \Youshido\GraphQL\Schema\AbstractSchema $schema
-   *   The graphql schema.
-   * @param \Drupal\graphql\Reducers\ReducerManager $reducerManager
-   *   The reducer manager service.
+   * @var \Drupal\graphql\GraphQL\Execution\QueryProcessor
+   */
+  protected $queryProcessor;
+
+  /**
+   * The schema loader.
+   *
+   * @var \Drupal\graphql\GraphQL\Schema\SchemaLoader
+   */
+  protected $schemaLoader;
+
+  /**
+   * {@inheritdoc}
+   */
+  public static function create(ContainerInterface $container) {
+    return new static(
+      $container->get('config.factory')->get('system.performance'),
+      $container->get('http_kernel'),
+      $container->get('request_stack'),
+      $container->get('renderer'),
+      $container->get('graphql.query_processor')
+    );
+  }
+
+  /**
+   * RequestController constructor.
+   *
    * @param \Drupal\Core\Config\Config $config
    *   The config service.
    * @param \Symfony\Component\HttpKernel\HttpKernelInterface $httpKernel
@@ -91,38 +91,21 @@ class RequestController implements ContainerInjectionInterface {
    *   The request stack service.
    * @param \Drupal\Core\Render\RendererInterface $renderer
    *   The renderer service.
+   * @param \Drupal\graphql\GraphQL\Execution\QueryProcessor $queryProcessor
+   *   The query processor.
    */
   public function __construct(
-    ContainerInterface $container,
-    AbstractSchema $schema,
-    ReducerManager $reducerManager,
     Config $config,
     HttpKernelInterface $httpKernel,
     RequestStack $requestStack,
-    RendererInterface $renderer
+    RendererInterface $renderer,
+    QueryProcessor $queryProcessor
   ) {
-    $this->container = $container;
-    $this->schema = $schema;
-    $this->reducerManager = $reducerManager;
     $this->config = $config;
     $this->httpKernel = $httpKernel;
     $this->requestStack = $requestStack;
     $this->renderer = $renderer;
-  }
-
-  /**
-   * {@inheritdoc}
-   */
-  public static function create(ContainerInterface $container) {
-    return new static(
-      $container,
-      $container->get('graphql.schema'),
-      $container->get('graphql.reducer_manager'),
-      $container->get('config.factory')->get('system.performance'),
-      $container->get('http_kernel'),
-      $container->get('request_stack'),
-      $container->get('renderer')
-    );
+    $this->queryProcessor = $queryProcessor;
   }
 
   /**
@@ -137,47 +120,62 @@ class RequestController implements ContainerInjectionInterface {
    *   The JSON formatted response.
    */
   public function handleBatchRequest(Request $request, array $queries = []) {
-    $filterNumeric = function ($index) { return !is_numeric($index); };
+    $method = $request->getMethod();
+
+    // Array filter callback for filtering numeric values.
+    $filter = function($index) { return !is_numeric($index); };
 
     // PHP 5.5.x does not yet support the ARRAY_FILTER_USE_KEYS constant.
-    $requestParameters = $request->query->all();
-    $requestParametersKeys = array_filter(array_keys($requestParameters), $filterNumeric);
-    $requestParameters = array_intersect_key($requestParameters, array_flip($requestParametersKeys));
+    $parameters = $method === 'POST' ? $request->request->all() : $request->query->all();
+    $keys = array_filter(array_keys($parameters), $filter);
+    $parameters = array_intersect_key($parameters, array_flip($keys));
 
-    $requestContent = $request->query->all();
-    $requestContentKeys = array_filter($requestContent, $filterNumeric);
-    $requestContent = array_intersect_key($requestContent, array_flip($requestContentKeys));
+    $content = ($content = $request->getContent()) ? json_decode($content, TRUE) : [];
+    $keys = array_filter(array_keys($content), $filter);
+    $content = array_intersect_key($content, array_flip($keys));
+    
+    // Retain the original session for sub-requests. This is necessary in
+    // case of sub-requests that alter the session in some way (e.g.
+    // authentication).
+    $session = $request->getSession();
+
+    // Repeat the request on the previous route.
+    $url = Url::fromRoute($request->attributes->get('_route'))
+      ->toString(TRUE)
+      ->getGeneratedUrl();
+
+    // Extract the remaining needed parameters from the current request.
+    $cookies = $request->cookies->all();
+    $files = $request->files->all();
+    $server = $request->server->all();
 
     // Walk over all queries and issue a sub-request for each.
-    $responses = array_map(function ($query) use ($request, $requestParameters, $requestContent) {
-      $method = $request->getMethod();
+    $responses = array_map(function($query) use ($method, $parameters, $content, $session, $url, $cookies, $files, $server) {
+      $content = json_encode(array_merge($content, $query));
 
-      // Make sure we remove the 'queries' parameter, otherwise the subsequent
-      // request could trigger the batch processing again.
-      $parameters = array_merge($requestParameters, $query);
-      $content = $method === 'POST' ? array_merge($query, $requestContent) : FALSE;
-      $content = $content ? json_encode($content) : '';
-
-      $subRequest = Request::create(
-        '/graphql',
+      // Create the sub-request with the batched query parameters merged into
+      // the request body content. This is the best spot because the body
+      // content gets precedence over the GET or POST parameters.
+      $request = Request::create(
+        $url,
         $method,
         $parameters,
-        $request->cookies->all(),
-        $request->files->all(),
-        $request->server->all(),
+        $cookies,
+        $files,
+        $server,
         $content
       );
 
-      if ($session = $request->getSession()) {
-        $subRequest->setSession($session);
+      if (!empty($session)) {
+        $request->setSession($session);
       }
 
-      $output = $this->httpKernel->handle($subRequest, HttpKernelInterface::SUB_REQUEST);
+      $output = $this->httpKernel->handle($request, HttpKernelInterface::SUB_REQUEST);
 
       // TODO:
       // Remove the request stack manipulation once the core issue described at
       // https://www.drupal.org/node/2613044 is resolved.
-      while ($this->requestStack->getCurrentRequest() === $subRequest) {
+      while ($this->requestStack->getCurrentRequest() === $request) {
         $this->requestStack->pop();
       }
 
@@ -185,8 +183,8 @@ class RequestController implements ContainerInjectionInterface {
     }, $queries);
 
     // Gather all responses from all sub-requests.
-    $content = array_map(function (Response $response) {
-      return json_decode($response->getContent());
+    $content = array_map(function(Response $response) {
+      return $response->getStatusCode() === 200 ? json_decode($response->getContent()) : NULL;
     }, $responses);
 
     $metadata = new CacheableMetadata();
@@ -194,7 +192,7 @@ class RequestController implements ContainerInjectionInterface {
     $metadata->setCacheMaxAge(Cache::PERMANENT);
 
     // Collect all of the metadata from all sub-requests.
-    $metadata = array_reduce($responses, function (RefinableCacheableDependencyInterface $carry, $current) {
+    $metadata = array_reduce($responses, function(RefinableCacheableDependencyInterface $carry, $current) {
       $current = $current instanceof CacheableResponseInterface ? $current->getCacheableMetadata() : $current;
       $carry->addCacheableDependency($current);
       return $carry;
@@ -209,43 +207,32 @@ class RequestController implements ContainerInjectionInterface {
   /**
    * Handles GraphQL requests.
    *
-   * @param \Symfony\Component\HttpFoundation\Request $request
-   *   The request object.
+   * @param string $schema
+   *   The name of the graphql schema.
    * @param string $query
    *   The query string.
    * @param array $variables
    *   The variables to process the query string with.
    *
-   * @return \Symfony\Component\HttpFoundation\JsonResponse
+   * @return \Drupal\Core\Cache\CacheableJsonResponse
    *   The JSON formatted response.
    */
-  public function handleRequest(Request $request, $query = '', array $variables = []) {
+  public function handleRequest($schema, $query = '', array $variables = []) {
+    /** @var \Drupal\graphql\GraphQL\Execution\QueryResult $result */
+    $result = NULL;
     $context = new RenderContext();
-    $processor = new Processor($this->container, $this->schema);
 
     // Evaluating the GraphQL request can potentially invoke rendering. We allow
     // those to "leak" and collect them here in a render context.
-    $this->renderer->executeInRenderContext($context, function () use ($processor, $query, $variables) {
-      $processor->processPayload($query, $variables, $this->reducerManager->getAllServices());
+    $this->renderer->executeInRenderContext($context, function() use ($schema, $query, $variables, &$result) {
+      $result = $this->queryProcessor->processQuery($schema, $query, $variables);
     });
 
-    $result = $processor->getResponseData();
-    $response = new CacheableJsonResponse($result);
+    $response = new CacheableQueryResponse($result);
+    // Apply render context cache metadata to the response.
     if (!$context->isEmpty()) {
       $response->addCacheableDependency($context->pop());
     }
-
-    $metadata = new CacheableMetadata();
-    // Default to permanent cache.
-    $metadata->setCacheMaxAge(Cache::PERMANENT);
-    // Add cache metadata from the processor and result stages.
-    $metadata->addCacheableDependency($processor);
-    // Apply the metadata to the response object.
-    $response->addCacheableDependency($metadata);
-
-    // Set the execution context on the request attributes for use in the
-    // request subscriber and cache policies.
-    $request->attributes->set('graphql_execution_context', $processor->getExecutionContext());
 
     return $response;
   }
